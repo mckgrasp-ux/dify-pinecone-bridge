@@ -6,40 +6,25 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-from openai import OpenAI
 from pinecone import Pinecone
 
-
-# =========================
-# ENV VARIABLES
-# =========================
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")  # np. dify-knowledge
-PINECONE_HOST = os.getenv("PINECONE_HOST")              # Twój host z Pinecone
+PINECONE_HOST = os.getenv("PINECONE_HOST")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+NAMESPACE = os.getenv("PINECONE_NAMESPACE", "__default__")
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+# MUSI się zgadzać z Field map w Pinecone (ustawiłeś chunk_text)
+TEXT_FIELD = os.getenv("TEXT_FIELD", "chunk_text")
+
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
-
-app = FastAPI(title="Dify External Knowledge Bridge (Pinecone)")
-
-
-# =========================
-# HELPERS
-# =========================
-
-def get_openai():
-    if not OPENAI_API_KEY:
-        raise Exception("Missing OPENAI_API_KEY")
-    return OpenAI(api_key=OPENAI_API_KEY)
+app = FastAPI(title="Dify External Knowledge Bridge (Pinecone Integrated Embedding)")
 
 
 def get_index():
-    if not PINECONE_API_KEY or not PINECONE_INDEX_NAME or not PINECONE_HOST:
-        raise Exception("Missing Pinecone configuration")
+    if not (PINECONE_API_KEY and PINECONE_HOST and PINECONE_INDEX_NAME):
+        raise Exception("Missing Pinecone env vars")
     pc = Pinecone(api_key=PINECONE_API_KEY)
     return pc.Index(PINECONE_INDEX_NAME, host=PINECONE_HOST)
 
@@ -48,52 +33,38 @@ def chunk_text(text: str, size: int, overlap: int) -> List[str]:
     text = " ".join(text.split())
     if not text:
         return []
-
-    chunks = []
+    out = []
     start = 0
-
     while start < len(text):
         end = min(len(text), start + size)
-        chunks.append(text[start:end])
-
+        out.append(text[start:end])
         if end == len(text):
             break
-
         start = max(0, end - overlap)
+    return out
 
-    return chunks
 
+def extract_text(filename: str, data: bytes) -> str:
+    name = (filename or "").lower()
 
-def extract_text(file: UploadFile, data: bytes) -> str:
-    filename = (file.filename or "").lower()
-
-    if filename.endswith(".pdf"):
+    if name.endswith(".pdf"):
         from io import BytesIO
         reader = PdfReader(BytesIO(data))
         return "\n".join([(p.extract_text() or "") for p in reader.pages])
 
-    if filename.endswith(".docx"):
+    if name.endswith(".docx"):
         from io import BytesIO
         doc = DocxDocument(BytesIO(data))
         return "\n".join([p.text for p in doc.paragraphs])
 
-    # txt / md / fallback
     return data.decode("utf-8", errors="ignore")
 
-
-# =========================
-# MODELS
-# =========================
 
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 5
     namespace: Optional[str] = None
 
-
-# =========================
-# ROUTES
-# =========================
 
 @app.get("/health")
 def health():
@@ -102,77 +73,58 @@ def health():
 
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...), namespace: Optional[str] = None):
-
-    if not OPENAI_API_KEY or not PINECONE_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing API keys")
+    try:
+        index = get_index()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     data = await file.read()
-    text = extract_text(file, data)
+    text = extract_text(file.filename or "file", data)
+
     chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
-
     if not chunks:
-        raise HTTPException(status_code=400, detail="No text extracted")
+        raise HTTPException(status_code=400, detail="No text extracted (empty or scanned PDF?)")
 
-    client = get_openai()
+    records = []
+    for ch in chunks:
+        records.append({
+            "_id": str(uuid.uuid4()),
+            TEXT_FIELD: ch,              # Pinecone zrobi embedding automatycznie
+            "source": file.filename or "file",
+        })
 
-    embeddings_response = client.embeddings.create(
-        model=EMBED_MODEL,
-        input=chunks
-    )
+    ns = namespace or NAMESPACE
+    index.upsert_records(ns, records)
 
-    vectors = []
-    for chunk, emb in zip(chunks, embeddings_response.data):
-        vectors.append(
-            (
-                str(uuid.uuid4()),
-                emb.embedding,
-                {
-                    "content": chunk,
-                    "source": file.filename
-                }
-            )
-        )
-
-    index = get_index()
-    index.upsert(vectors=vectors, namespace=namespace or "")
-
-    return {
-        "uploaded": file.filename,
-        "chunks": len(chunks),
-        "namespace": namespace or ""
-    }
+    return {"uploaded": file.filename, "chunks": len(chunks), "namespace": ns}
 
 
 @app.post("/search")
 def search(req: SearchRequest):
+    try:
+        index = get_index()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    if not OPENAI_API_KEY or not PINECONE_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing API keys")
+    ns = req.namespace or NAMESPACE
 
-    client = get_openai()
-
-    query_embedding = client.embeddings.create(
-        model=EMBED_MODEL,
-        input=req.query
-    ).data[0].embedding
-
-    index = get_index()
-
-    results = index.query(
-        vector=query_embedding,
-        top_k=req.top_k,
-        include_metadata=True,
-        namespace=req.namespace or ""
+    res = index.search(
+        namespace=ns,
+        query={
+            "inputs": {"text": req.query},
+            "top_k": req.top_k
+        },
+        fields=["source", TEXT_FIELD]
     )
 
+    hits = res.get("result", {}).get("hits", []) if isinstance(res, dict) else []
     documents = []
-
-    for match in (results.matches or []):
-        metadata = match.metadata or {}
+    for h in hits:
+        fields = h.get("fields", {})
         documents.append({
-            "content": metadata.get("content", ""),
-            "score": float(match.score or 0.0),
-            "source": metadata.get("source")
+            "content": fields.get(TEXT_FIELD, ""),
+            "score": float(h.get("score", 0.0)),
+            "source": fields.get("source")
         })
 
     return {"documents": documents}

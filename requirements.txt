@@ -2,4 +2,4 @@ fastapi==0.110.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 pypdf==4.2.0
-pinecone
+pinecone-client==5.0.1

@@ -1,50 +1,78 @@
 import os
 import re
-import hashlib
+import uuid
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from fastapi.responses import JSONResponse
+
 from pypdf import PdfReader
 
 from pinecone import Pinecone
 
 
 # -----------------------------
-# Config / env
+# Config (ENV)
 # -----------------------------
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "").strip()
 PINECONE_HOST = os.getenv("PINECONE_HOST", "").strip()
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "").strip()  # optional (tylko informacyjnie)
-TEXT_FIELD = os.getenv("TEXT_FIELD", "text").strip()  # w Pinecone UI masz field map "text"
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "").strip()
 
-if not PINECONE_API_KEY:
-    raise RuntimeError("Missing env var: PINECONE_API_KEY")
-if not PINECONE_HOST:
-    raise RuntimeError("Missing env var: PINECONE_HOST")
+# Pinecone Inference embedding model (z UI Pinecone: np. multilingual-e5-large)
+PINECONE_EMBED_MODEL = os.getenv("PINECONE_EMBED_MODEL", "multilingual-e5-large").strip()
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(host=PINECONE_HOST)
+# Chunking
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))      # znaki
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200")) # znaki
 
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def _clean_text(s: str) -> str:
-    s = s.replace("\u00a0", " ")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+# Batch sizes
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "64"))
+UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    reader = PdfReader(io_bytes := bytes(pdf_bytes))  # keep a local ref
-    # pypdf accepts file-like, but also bytes in some contexts; safest: use memoryview via BytesIO
-    from io import BytesIO
-    bio = BytesIO(io_bytes)
-    reader = PdfReader(bio)
+def _require_env():
+    missing = []
+    if not PINECONE_API_KEY:
+        missing.append("PINECONE_API_KEY")
+    if not PINECONE_HOST:
+        missing.append("PINECONE_HOST")
+    if not PINECONE_INDEX_NAME:
+        missing.append("PINECONE_INDEX_NAME")
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing environment variables: {', '.join(missing)}",
+        )
 
-    parts: List[str] = []
+
+def _clean_text(t: str) -> str:
+    t = t.replace("\u0000", " ")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end == n:
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    """Zwraca listę: [{page: int, text: str}, ...]"""
+    reader = PdfReader(io_bytes := _BytesIO(pdf_bytes))
+    pages = []
     for i, page in enumerate(reader.pages):
         try:
             txt = page.extract_text() or ""
@@ -52,50 +80,43 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
             txt = ""
         txt = _clean_text(txt)
         if txt:
-            parts.append(f"[page {i+1}]\n{txt}")
-    return "\n\n".join(parts).strip()
+            pages.append({"page": i + 1, "text": txt})
+    return pages
 
 
-def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
-    """
-    Prosty chunking po znakach z overlapem.
-    max_chars ~ bezpiecznie dla większości embedderów; masz limit 507 tokens w e5-large,
-    więc trzymamy się raczej krótszych kawałków.
-    """
-    text = _clean_text(text)
-    if not text:
-        return []
+class _BytesIO:
+    """Minimalny BytesIO bez importu io (żeby było ultra-prosto na Render)."""
+    def __init__(self, b: bytes):
+        self._b = b
+        self._i = 0
 
-    chunks: List[str] = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + max_chars, n)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
+    def read(self, n: Optional[int] = -1) -> bytes:
+        if n is None or n < 0:
+            n = len(self._b) - self._i
+        out = self._b[self._i:self._i + n]
+        self._i += len(out)
+        return out
 
-        if end >= n:
-            break
-        start = max(0, end - overlap)
-    return chunks
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._i = pos
+        elif whence == 1:
+            self._i += pos
+        elif whence == 2:
+            self._i = len(self._b) + pos
+        self._i = max(0, min(self._i, len(self._b)))
+        return self._i
 
-
-def stable_id(namespace: str, filename: str, chunk_index: int, chunk_text: str) -> str:
-    h = hashlib.sha1()
-    h.update(namespace.encode("utf-8"))
-    h.update(b"|")
-    h.update(filename.encode("utf-8"))
-    h.update(b"|")
-    h.update(str(chunk_index).encode("utf-8"))
-    h.update(b"|")
-    h.update(chunk_text.encode("utf-8", errors="ignore"))
-    return h.hexdigest()
+    def tell(self) -> int:
+        return self._i
 
 
-# -----------------------------
-# FastAPI
-# -----------------------------
+def _get_clients():
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    index = pc.Index(host=PINECONE_HOST)
+    return pc, index
+
+
 app = FastAPI(title="dify-pinecone-bridge", version="1.0.0")
 
 
@@ -106,83 +127,100 @@ def root():
 
 @app.get("/health")
 def health():
+    _require_env()
     return {
         "ok": True,
-        "pinecone_host": PINECONE_HOST,
-        "index_name": PINECONE_INDEX_NAME or None,
-        "text_field": TEXT_FIELD,
+        "index": PINECONE_INDEX_NAME,
+        "host": PINECONE_HOST,
+        "embed_model": PINECONE_EMBED_MODEL,
     }
 
 
 @app.post("/ingest")
 async def ingest(
-    namespace: str = Query(..., description="Pinecone namespace, np. nordkalk"),
     file: UploadFile = File(...),
-    chunk_chars: int = Query(1800, ge=500, le=4000),
-    chunk_overlap: int = Query(200, ge=0, le=800),
+    namespace: str = Query("default"),
+    source: str = Query("upload"),
 ):
     """
-    Upload PDF -> extract text -> chunk -> upsert_records() do Pinecone
-    Wymaga indexu z Integrated embedding (field map = TEXT_FIELD, domyślnie 'text').
+    Upload PDF -> extract text -> embed via Pinecone Inference -> upsert vectors.
     """
-    if not namespace.strip():
-        raise HTTPException(status_code=400, detail="namespace is required")
+    _require_env()
 
-    filename = file.filename or "file"
-    content = await file.read()
-    if not content:
+    filename = file.filename or "file.pdf"
+    data = await file.read()
+    if not data:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # Basic type check (nie blokujemy na 100%, ale pomagamy)
-    if not (filename.lower().endswith(".pdf") or (file.content_type or "").lower() == "application/pdf"):
-        # możesz to zmienić na warning, jeśli chcesz inne pliki
-        raise HTTPException(status_code=400, detail="Only PDF is supported for now (.pdf)")
-
-    # Extract
+    # 1) Extract per page
     try:
-        text = extract_text_from_pdf(content)
+        pages = _extract_pdf_text(data)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF parse error: {e}")
+        raise HTTPException(status_code=400, detail=f"PDF parse error: {e}")
 
-    if not text:
-        raise HTTPException(status_code=400, detail="No extractable text in PDF")
+    if not pages:
+        raise HTTPException(status_code=400, detail="No extractable text found in PDF")
 
-    # Chunk
-    chunks = chunk_text(text, max_chars=chunk_chars, overlap=chunk_overlap)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No chunks produced")
+    # 2) Chunk
+    chunks: List[Dict[str, Any]] = []
+    for p in pages:
+        page_no = p["page"]
+        for j, ch in enumerate(_chunk_text(p["text"], CHUNK_SIZE, CHUNK_OVERLAP), start=1):
+            chunks.append(
+                {
+                    "id": f"{uuid.uuid4()}",
+                    "text": ch,
+                    "metadata": {
+                        "source": source,
+                        "filename": filename,
+                        "page": page_no,
+                        "chunk": j,
+                    },
+                }
+            )
 
-    # Build records for Integrated Embedding
-    # Pinecone expects: {"id": "...", "<TEXT_FIELD>": "...", "metadata": {...}}
-    records: List[Dict[str, Any]] = []
-    for i, ch in enumerate(chunks):
-        rid = stable_id(namespace, filename, i, ch)
-        records.append(
-            {
-                "id": rid,
-                TEXT_FIELD: ch,
-                "metadata": {
-                    "source": filename,
-                    "chunk": i,
-                    "chunks_total": len(chunks),
-                    "namespace": namespace,
-                },
-            }
-        )
+    # 3) Embed + upsert
+    pc, index = _get_clients()
 
-    # Upsert to Pinecone using integrated embedding
+    total_upserted = 0
     try:
-        # upsert_records działa w pakiecie "pinecone" (nowe SDK)
-        index.upsert_records(namespace=namespace, records=records)
+        # batch embed
+        for i in range(0, len(chunks), EMBED_BATCH):
+            batch = chunks[i:i + EMBED_BATCH]
+            texts = [b["text"] for b in batch]
+
+            emb = pc.inference.embed(
+                model=PINECONE_EMBED_MODEL,
+                inputs=texts,
+                parameters={"input_type": "passage"},
+            )
+
+            vectors = []
+            for item, vec in zip(batch, emb.data):
+                vectors.append(
+                    {
+                        "id": item["id"],
+                        "values": vec["values"],
+                        "metadata": {**item["metadata"], "text": item["text"]},
+                    }
+                )
+
+            # upsert in smaller batches if needed
+            for k in range(0, len(vectors), UPSERT_BATCH):
+                part = vectors[k:k + UPSERT_BATCH]
+                index.upsert(vectors=part, namespace=namespace)
+                total_upserted += len(part)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pinecone upsert error: {e}")
+        raise HTTPException(status_code=500, detail=f"Ingest failed: {e}")
 
     return JSONResponse(
         {
             "ok": True,
+            "filename": filename,
             "namespace": namespace,
-            "file": filename,
+            "pages_with_text": len(pages),
             "chunks": len(chunks),
-            "note": "Upserted via integrated embedding",
+            "upserted": total_upserted,
         }
     )

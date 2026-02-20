@@ -1,226 +1,242 @@
 import os
-import re
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.responses import JSONResponse
-
 from pypdf import PdfReader
 
 from pinecone import Pinecone
 
+# -------------------------
+# ENV
+# -------------------------
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+PINECONE_HOST = os.getenv("PINECONE_HOST", "")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "")
+TEXT_FIELD = os.getenv("TEXT_FIELD", "text")
 
-# -----------------------------
-# Config (ENV)
-# -----------------------------
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "").strip()
-PINECONE_HOST = os.getenv("PINECONE_HOST", "").strip()
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "").strip()
+# API key for Dify -> External Knowledge API
+EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY", "")
 
-# Pinecone Inference embedding model (z UI Pinecone: np. multilingual-e5-large)
-PINECONE_EMBED_MODEL = os.getenv("PINECONE_EMBED_MODEL", "multilingual-e5-large").strip()
+if not PINECONE_API_KEY or not PINECONE_HOST:
+    # index name is optional if you target by host, but we keep it for clarity
+    pass
 
-# Chunking
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))      # znaki
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200")) # znaki
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(host=PINECONE_HOST)
 
-# Batch sizes
-EMBED_BATCH = int(os.getenv("EMBED_BATCH", "64"))
-UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
-
-
-def _require_env():
-    missing = []
-    if not PINECONE_API_KEY:
-        missing.append("PINECONE_API_KEY")
-    if not PINECONE_HOST:
-        missing.append("PINECONE_HOST")
-    if not PINECONE_INDEX_NAME:
-        missing.append("PINECONE_INDEX_NAME")
-    if missing:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Missing environment variables: {', '.join(missing)}",
-        )
+app = FastAPI()
 
 
-def _clean_text(t: str) -> str:
-    t = t.replace("\u0000", " ")
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
+# -------------------------
+# helpers
+# -------------------------
+def _check_auth(authorization: Optional[str], x_api_key: Optional[str]) -> None:
+    """
+    Accept:
+      - Authorization: Bearer <token>
+      - X-API-Key: <token>
+    If EXTERNAL_API_KEY is empty -> no auth enforced (not recommended).
+    """
+    if not EXTERNAL_API_KEY:
+        return
+
+    token = None
+    if authorization:
+        parts = authorization.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1].strip()
+        else:
+            token = authorization.strip()
+
+    if not token and x_api_key:
+        token = x_api_key.strip()
+
+    if token != EXTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+def _pdf_to_pages_text(file_path: str) -> List[str]:
+    reader = PdfReader(file_path)
+    pages = []
+    for p in reader.pages:
+        txt = p.extract_text() or ""
+        # lekkie czyszczenie
+        txt = " ".join(txt.split())
+        pages.append(txt)
+    return pages
+
+
+def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
+    """
+    Prosty chunker po znakach (wystarczy na start).
+    """
     if not text:
         return []
+
     chunks = []
-    start = 0
+    i = 0
     n = len(text)
-    while start < n:
-        end = min(n, start + chunk_size)
-        chunk = text[start:end].strip()
+    while i < n:
+        end = min(i + max_chars, n)
+        chunk = text[i:end].strip()
         if chunk:
             chunks.append(chunk)
         if end == n:
             break
-        start = max(0, end - overlap)
+        i = max(0, end - overlap)
     return chunks
 
 
-def _extract_pdf_text(pdf_bytes: bytes) -> List[Dict[str, Any]]:
-    """Zwraca listę: [{page: int, text: str}, ...]"""
-    reader = PdfReader(io_bytes := _BytesIO(pdf_bytes))
-    pages = []
-    for i, page in enumerate(reader.pages):
-        try:
-            txt = page.extract_text() or ""
-        except Exception:
-            txt = ""
-        txt = _clean_text(txt)
-        if txt:
-            pages.append({"page": i + 1, "text": txt})
-    return pages
-
-
-class _BytesIO:
-    """Minimalny BytesIO bez importu io (żeby było ultra-prosto na Render)."""
-    def __init__(self, b: bytes):
-        self._b = b
-        self._i = 0
-
-    def read(self, n: Optional[int] = -1) -> bytes:
-        if n is None or n < 0:
-            n = len(self._b) - self._i
-        out = self._b[self._i:self._i + n]
-        self._i += len(out)
-        return out
-
-    def seek(self, pos: int, whence: int = 0) -> int:
-        if whence == 0:
-            self._i = pos
-        elif whence == 1:
-            self._i += pos
-        elif whence == 2:
-            self._i = len(self._b) + pos
-        self._i = max(0, min(self._i, len(self._b)))
-        return self._i
-
-    def tell(self) -> int:
-        return self._i
-
-
-def _get_clients():
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    index = pc.Index(host=PINECONE_HOST)
-    return pc, index
-
-
-app = FastAPI(title="dify-pinecone-bridge", version="1.0.0")
-
-
+# -------------------------
+# health
+# -------------------------
 @app.get("/")
 def root():
     return {"ok": True}
 
 
-@app.get("/health")
-def health():
-    _require_env()
-    return {
-        "ok": True,
-        "index": PINECONE_INDEX_NAME,
-        "host": PINECONE_HOST,
-        "embed_model": PINECONE_EMBED_MODEL,
-    }
-
-
+# -------------------------
+# ingest: multipart file -> pinecone upsert_records
+# -------------------------
 @app.post("/ingest")
-async def ingest(
-    file: UploadFile = File(...),
-    namespace: str = Query("default"),
-    source: str = Query("upload"),
-):
-    """
-    Upload PDF -> extract text -> embed via Pinecone Inference -> upsert vectors.
-    """
-    _require_env()
+async def ingest(namespace: str = "default", file: UploadFile = File(...)):
+    # zapis tymczasowy
+    tmp_name = f"/tmp/{uuid.uuid4().hex}_{file.filename}"
+    content = await file.read()
+    with open(tmp_name, "wb") as f:
+        f.write(content)
 
-    filename = file.filename or "file.pdf"
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    # 1) Extract per page
     try:
-        pages = _extract_pdf_text(data)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"PDF parse error: {e}")
+        pages = _pdf_to_pages_text(tmp_name)
+        pages_with_text = 0
+        records: List[Dict[str, Any]] = []
 
-    if not pages:
-        raise HTTPException(status_code=400, detail="No extractable text found in PDF")
+        for page_idx, page_text in enumerate(pages, start=1):
+            if not page_text.strip():
+                continue
+            pages_with_text += 1
 
-    # 2) Chunk
-    chunks: List[Dict[str, Any]] = []
-    for p in pages:
-        page_no = p["page"]
-        for j, ch in enumerate(_chunk_text(p["text"], CHUNK_SIZE, CHUNK_OVERLAP), start=1):
-            chunks.append(
+            chunks = _chunk_text(page_text)
+            for chunk_idx, chunk in enumerate(chunks, start=1):
+                rec_id = uuid.uuid4().hex
+                # Records API: _id + fields (zgodne z field_map w indexie)
+                rec = {
+                    "_id": rec_id,
+                    TEXT_FIELD: chunk,
+                    "filename": file.filename,
+                    "page": page_idx,
+                    "chunk": chunk_idx,
+                    "source": "upload",
+                }
+                records.append(rec)
+
+        if not records:
+            return JSONResponse(
                 {
-                    "id": f"{uuid.uuid4()}",
-                    "text": ch,
-                    "metadata": {
-                        "source": source,
-                        "filename": filename,
-                        "page": page_no,
-                        "chunk": j,
-                    },
+                    "ok": True,
+                    "filename": file.filename,
+                    "namespace": namespace,
+                    "pages_with_text": 0,
+                    "chunks": 0,
+                    "upserted": 0,
                 }
             )
 
-    # 3) Embed + upsert
-    pc, index = _get_clients()
+        # Pinecone integrated embedding: upsert_records(namespace, records)
+        index.upsert_records(namespace, records)
 
-    total_upserted = 0
+        return JSONResponse(
+            {
+                "ok": True,
+                "filename": file.filename,
+                "namespace": namespace,
+                "pages_with_text": pages_with_text,
+                "chunks": len(records),
+                "upserted": len(records),
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.remove(tmp_name)
+        except Exception:
+            pass
+
+
+# -------------------------
+# retrieval: Dify External Knowledge API
+# POST /retrieval
+# -------------------------
+@app.post("/retrieval")
+async def retrieval(
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Dify wysyła m.in.:
+    {
+      "query": "...",
+      "knowledge_id": "nordkalk",
+      "retrieval_setting": { "top_k": 4, "score_threshold": 0.5 }
+    }
+
+    Oczekuje:
+    { "records": [ { "content": "...", "score": 0.8, "title": "...", "metadata": {...} }, ... ] }
+    """
+    _check_auth(authorization, x_api_key)
+
+    query = (payload.get("query") or "").strip()
+    knowledge_id = (payload.get("knowledge_id") or "").strip()
+    rs = payload.get("retrieval_setting") or {}
+
+    if not query:
+        return {"records": []}
+
+    namespace = knowledge_id or "default"
+    top_k = int(rs.get("top_k") or 4)
+    score_threshold = rs.get("score_threshold", None)
+    score_threshold = float(score_threshold) if score_threshold is not None else None
+
     try:
-        # batch embed
-        for i in range(0, len(chunks), EMBED_BATCH):
-            batch = chunks[i:i + EMBED_BATCH]
-            texts = [b["text"] for b in batch]
+        # Integrated embedding search by text:
+        res = index.search(
+            namespace=namespace,
+            query={
+                "top_k": top_k,
+                "inputs": {"text": query},
+            },
+        )
 
-            emb = pc.inference.embed(
-                model=PINECONE_EMBED_MODEL,
-                inputs=texts,
-                parameters={"input_type": "passage"},
+        hits = (((res or {}).get("result") or {}).get("hits") or [])
+        out: List[Dict[str, Any]] = []
+
+        for h in hits:
+            score = float(h.get("_score") or 0.0)
+            fields = h.get("fields") or {}
+
+            if score_threshold is not None and score < score_threshold:
+                continue
+
+            content = fields.get(TEXT_FIELD) or fields.get("text") or ""
+            title = fields.get("filename") or "document"
+
+            metadata = dict(fields)
+            metadata["id"] = h.get("_id")
+            metadata["namespace"] = namespace
+
+            out.append(
+                {
+                    "content": content,
+                    "score": score,
+                    "title": title,
+                    "metadata": metadata,
+                }
             )
 
-            vectors = []
-            for item, vec in zip(batch, emb.data):
-                vectors.append(
-                    {
-                        "id": item["id"],
-                        "values": vec["values"],
-                        "metadata": {**item["metadata"], "text": item["text"]},
-                    }
-                )
-
-            # upsert in smaller batches if needed
-            for k in range(0, len(vectors), UPSERT_BATCH):
-                part = vectors[k:k + UPSERT_BATCH]
-                index.upsert(vectors=part, namespace=namespace)
-                total_upserted += len(part)
-
+        return {"records": out}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ingest failed: {e}")
-
-    return JSONResponse(
-        {
-            "ok": True,
-            "filename": filename,
-            "namespace": namespace,
-            "pages_with_text": len(pages),
-            "chunks": len(chunks),
-            "upserted": total_upserted,
-        }
-    )
+        raise HTTPException(status_code=500, detail=str(e))

@@ -14,14 +14,11 @@ from pinecone import Pinecone
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
 PINECONE_HOST = os.getenv("PINECONE_HOST", "")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "")
-TEXT_FIELD = os.getenv("TEXT_FIELD", "text")
+# IMPORTANT: must match Pinecone index field_mapping text field (you got "chunk_text" error)
+TEXT_FIELD = os.getenv("TEXT_FIELD", "chunk_text")
 
 # API key for Dify -> External Knowledge API
 EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY", "")
-
-if not PINECONE_API_KEY or not PINECONE_HOST:
-    # index name is optional if you target by host, but we keep it for clarity
-    pass
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(host=PINECONE_HOST)
@@ -33,12 +30,6 @@ app = FastAPI()
 # helpers
 # -------------------------
 def _check_auth(authorization: Optional[str], x_api_key: Optional[str]) -> None:
-    """
-    Accept:
-      - Authorization: Bearer <token>
-      - X-API-Key: <token>
-    If EXTERNAL_API_KEY is empty -> no auth enforced (not recommended).
-    """
     if not EXTERNAL_API_KEY:
         return
 
@@ -62,19 +53,14 @@ def _pdf_to_pages_text(file_path: str) -> List[str]:
     pages = []
     for p in reader.pages:
         txt = p.extract_text() or ""
-        # lekkie czyszczenie
         txt = " ".join(txt.split())
         pages.append(txt)
     return pages
 
 
 def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
-    """
-    Prosty chunker po znakach (wystarczy na start).
-    """
     if not text:
         return []
-
     chunks = []
     i = 0
     n = len(text)
@@ -89,6 +75,10 @@ def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[st
     return chunks
 
 
+def _batched(lst: List[Any], batch_size: int) -> List[List[Any]]:
+    return [lst[i:i + batch_size] for i in range(0, len(lst), batch_size)]
+
+
 # -------------------------
 # health
 # -------------------------
@@ -98,11 +88,10 @@ def root():
 
 
 # -------------------------
-# ingest: multipart file -> pinecone upsert_records
+# ingest
 # -------------------------
 @app.post("/ingest")
 async def ingest(namespace: str = "default", file: UploadFile = File(...)):
-    # zapis tymczasowy
     tmp_name = f"/tmp/{uuid.uuid4().hex}_{file.filename}"
     content = await file.read()
     with open(tmp_name, "wb") as f:
@@ -121,10 +110,9 @@ async def ingest(namespace: str = "default", file: UploadFile = File(...)):
             chunks = _chunk_text(page_text)
             for chunk_idx, chunk in enumerate(chunks, start=1):
                 rec_id = uuid.uuid4().hex
-                # Records API: _id + fields (zgodne z field_map w indexie)
                 rec = {
                     "_id": rec_id,
-                    TEXT_FIELD: chunk,
+                    TEXT_FIELD: chunk,  # MUST match index field_mapping (e.g. chunk_text)
                     "filename": file.filename,
                     "page": page_idx,
                     "chunk": chunk_idx,
@@ -141,11 +129,17 @@ async def ingest(namespace: str = "default", file: UploadFile = File(...)):
                     "pages_with_text": 0,
                     "chunks": 0,
                     "upserted": 0,
+                    "text_field": TEXT_FIELD,
                 }
             )
 
-        # Pinecone integrated embedding: upsert_records(namespace, records)
-        index.upsert_records(namespace, records)
+        # Pinecone has limits on batch sizes for upsert_records; stay safely under 96
+        BATCH_SIZE = int(os.getenv("UPSERT_BATCH_SIZE", "80"))
+
+        upserted = 0
+        for batch in _batched(records, BATCH_SIZE):
+            index.upsert_records(namespace, batch)
+            upserted += len(batch)
 
         return JSONResponse(
             {
@@ -154,7 +148,9 @@ async def ingest(namespace: str = "default", file: UploadFile = File(...)):
                 "namespace": namespace,
                 "pages_with_text": pages_with_text,
                 "chunks": len(records),
-                "upserted": len(records),
+                "upserted": upserted,
+                "text_field": TEXT_FIELD,
+                "batch_size": BATCH_SIZE,
             }
         )
     except Exception as e:
@@ -168,7 +164,6 @@ async def ingest(namespace: str = "default", file: UploadFile = File(...)):
 
 # -------------------------
 # retrieval: Dify External Knowledge API
-# POST /retrieval
 # -------------------------
 @app.post("/retrieval")
 async def retrieval(
@@ -176,17 +171,6 @@ async def retrieval(
     authorization: Optional[str] = Header(default=None),
     x_api_key: Optional[str] = Header(default=None),
 ):
-    """
-    Dify wysyła m.in.:
-    {
-      "query": "...",
-      "knowledge_id": "nordkalk",
-      "retrieval_setting": { "top_k": 4, "score_threshold": 0.5 }
-    }
-
-    Oczekuje:
-    { "records": [ { "content": "...", "score": 0.8, "title": "...", "metadata": {...} }, ... ] }
-    """
     _check_auth(authorization, x_api_key)
 
     query = (payload.get("query") or "").strip()
@@ -202,12 +186,12 @@ async def retrieval(
     score_threshold = float(score_threshold) if score_threshold is not None else None
 
     try:
-        # Integrated embedding search by text:
+        # IMPORTANT: use TEXT_FIELD here too (not hardcoded "text")
         res = index.search(
             namespace=namespace,
             query={
                 "top_k": top_k,
-                "inputs": {"text": query},
+                "inputs": {TEXT_FIELD: query},
             },
         )
 
@@ -221,7 +205,7 @@ async def retrieval(
             if score_threshold is not None and score < score_threshold:
                 continue
 
-            content = fields.get(TEXT_FIELD) or fields.get("text") or ""
+            content = fields.get(TEXT_FIELD) or ""
             title = fields.get("filename") or "document"
 
             metadata = dict(fields)

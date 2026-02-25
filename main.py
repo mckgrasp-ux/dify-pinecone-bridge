@@ -16,7 +16,7 @@ PINECONE_HOST = os.getenv("PINECONE_HOST", "")
 TEXT_FIELD = os.getenv("TEXT_FIELD", "chunk_text") 
 EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY", "") 
 
-# Klucz do inteligencji czytającej tabele w PDF
+# Klucz do inteligencji czytajacej tabele w PDF
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY", "")
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -46,7 +46,7 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # -------------------------
-# LlamaParse - Bezpośrednie wywołanie API (Bez konfliktów bibliotek!)
+# LlamaParse - Bezposrednie wywolanie API (Bez konfliktow bibliotek!)
 # -------------------------
 def _pdf_to_pages_text(file_path: str) -> List[str]:
     if not LLAMA_CLOUD_API_KEY:
@@ -58,18 +58,18 @@ def _pdf_to_pages_text(file_path: str) -> List[str]:
         "Accept": "application/json"
     }
     
-    # 1. Wysyłamy plik na serwery AI
+    # 1. Wysylamy plik na serwery AI
     with open(file_path, "rb") as f:
         files = {"file": (os.path.basename(file_path), f, "application/pdf")}
-        data = {"language": "pl"} # Wymuszamy język polski
+        data = {"language": "pl"} # Wymuszamy jezyk polski
         
         resp = requests.post(f"{base_url}/upload", headers=headers, files=files, data=data)
         if resp.status_code != 200:
-            raise Exception(f"Błąd wysyłania do LlamaParse: {resp.text}")
+            raise Exception(f"Blad wysylania do LlamaParse: {resp.text}")
             
         job_id = resp.json()["id"]
 
-    # 2. Czekamy cierpliwie aż AI skończy czytać (odpytujemy co 3 sekundy)
+    # 2. Czekamy cierpliwie az AI skonczy czytac (odpytujemy co 3 sekundy)
     while True:
         time.sleep(3)
         status_resp = requests.get(f"{base_url}/job/{job_id}", headers=headers)
@@ -79,14 +79,14 @@ def _pdf_to_pages_text(file_path: str) -> List[str]:
         if status == "SUCCESS":
             break
         elif status in ["ERROR", "FAILED", "CANCELED"]:
-            raise Exception(f"LlamaParse napotkało błąd podczas analizy. Status: {status}")
+            raise Exception(f"LlamaParse napotkalo blad podczas analizy. Status: {status}")
 
     # 3. Pobieramy gotowy, zrekonstruowany tekst (Markdown z tabelami)
     res_resp = requests.get(f"{base_url}/job/{job_id}/result/markdown", headers=headers)
     res_resp.raise_for_status()
     markdown_text = res_resp.json()["markdown"]
 
-    # Zwracamy całość - LlamaParse samo zadbało o odpowiedni format
+    # Zwracamy calosc - LlamaParse samo zadbalo o odpowiedni format
     return [markdown_text]
 
 def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
@@ -215,7 +215,7 @@ async def retrieval(
                 "top_k": top_k,
                 "inputs": {"text": query},
             },
-            return_fields=[TEXT_FIELD, "text", "filename"]
+            fields=[TEXT_FIELD, "text", "filename"]
         )
 
         hits = (((res or {}).get("result") or {}).get("hits") or [])

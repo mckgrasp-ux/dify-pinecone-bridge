@@ -1,11 +1,12 @@
 import os
 import uuid
+import time
+import requests
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.responses import JSONResponse
 from pinecone import Pinecone
-from llama_parse import LlamaParse
 
 # -------------------------
 # ENV
@@ -15,11 +16,8 @@ PINECONE_HOST = os.getenv("PINECONE_HOST", "")
 TEXT_FIELD = os.getenv("TEXT_FIELD", "chunk_text") 
 EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY", "") 
 
-# Nowy klucz do inteligentnego czytania PDF
+# Klucz do inteligencji czytającej tabele w PDF
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY", "")
-
-if not PINECONE_API_KEY or not PINECONE_HOST:
-    pass
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(host=PINECONE_HOST)
@@ -48,30 +46,48 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # -------------------------
-# LlamaParse - AI PDF to Markdown
+# LlamaParse - Bezpośrednie wywołanie API (Bez konfliktów bibliotek!)
 # -------------------------
-async def _pdf_to_pages_text(file_path: str) -> List[str]:
+def _pdf_to_pages_text(file_path: str) -> List[str]:
     if not LLAMA_CLOUD_API_KEY:
-        raise ValueError("Brak LLAMA_CLOUD_API_KEY! Ustaw ten klucz w zmiennych środowiskowych Render.")
+        raise ValueError("Brak LLAMA_CLOUD_API_KEY w Renderze!")
     
-    # Konfiguracja parsera AI
-    parser = LlamaParse(
-        api_key=LLAMA_CLOUD_API_KEY,
-        result_type="markdown",  # Zwraca piękny Markdown z zachowaniem tabel
-        language="pl",           # Wymuszamy język polski, żeby perfekcyjnie czytał polskie znaki z obrazków
-        verbose=True
-    )
+    base_url = "https://api.cloud.llamaindex.ai/api/parsing"
+    headers = {
+        "Authorization": f"Bearer {LLAMA_CLOUD_API_KEY}",
+        "Accept": "application/json"
+    }
     
-    # LlamaParse czyta plik i odsyła go w doskonałym formacie
-    documents = await parser.aload_data(file_path)
-    
-    pages = []
-    for doc in documents:
-        txt = doc.text or ""
-        # Nie usuwamy na siłę spacji i entery, bo zniszczylibyśmy tabele w Markdown
-        pages.append(txt)
+    # 1. Wysyłamy plik na serwery AI
+    with open(file_path, "rb") as f:
+        files = {"file": (os.path.basename(file_path), f, "application/pdf")}
+        data = {"language": "pl"} # Wymuszamy język polski
         
-    return pages
+        resp = requests.post(f"{base_url}/upload", headers=headers, files=files, data=data)
+        if resp.status_code != 200:
+            raise Exception(f"Błąd wysyłania do LlamaParse: {resp.text}")
+            
+        job_id = resp.json()["id"]
+
+    # 2. Czekamy cierpliwie aż AI skończy czytać (odpytujemy co 3 sekundy)
+    while True:
+        time.sleep(3)
+        status_resp = requests.get(f"{base_url}/job/{job_id}", headers=headers)
+        status_resp.raise_for_status()
+        status = status_resp.json()["status"]
+        
+        if status == "SUCCESS":
+            break
+        elif status in ["ERROR", "FAILED", "CANCELED"]:
+            raise Exception(f"LlamaParse napotkało błąd podczas analizy. Status: {status}")
+
+    # 3. Pobieramy gotowy, zrekonstruowany tekst (Markdown z tabelami)
+    res_resp = requests.get(f"{base_url}/job/{job_id}/result/markdown", headers=headers)
+    res_resp.raise_for_status()
+    markdown_text = res_resp.json()["markdown"]
+
+    # Zwracamy całość - LlamaParse samo zadbało o odpowiedni format
+    return [markdown_text]
 
 def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
     if not text:
@@ -111,8 +127,7 @@ async def ingest(namespace: str = "default", file: UploadFile = File(...)):
         f.write(content)
 
     try:
-        # Tuta zaszła zmiana - teraz czekamy asynchronicznie na AI LlamaParse
-        pages = await _pdf_to_pages_text(tmp_name)
+        pages = _pdf_to_pages_text(tmp_name)
 
         pages_with_text = 0
         records: List[Dict[str, Any]] = []

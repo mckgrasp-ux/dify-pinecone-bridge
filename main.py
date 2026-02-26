@@ -8,6 +8,9 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.responses import JSONResponse
 from pinecone import Pinecone
 
+# Importy do semantycznego ciecia tekstu (LangChain)
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
 # -------------------------
 # ENV
 # -------------------------
@@ -16,7 +19,6 @@ PINECONE_HOST = os.getenv("PINECONE_HOST", "")
 TEXT_FIELD = os.getenv("TEXT_FIELD", "chunk_text") 
 EXTERNAL_API_KEY = os.getenv("EXTERNAL_API_KEY", "") 
 
-# Klucz do inteligencji czytajacej tabele w PDF
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY", "")
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -46,7 +48,7 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # -------------------------
-# LlamaParse - Bezposrednie wywolanie API (Bez konfliktow bibliotek!)
+# LlamaParse - Bezposrednie wywolanie API
 # -------------------------
 def _pdf_to_pages_text(file_path: str) -> List[str]:
     if not LLAMA_CLOUD_API_KEY:
@@ -58,10 +60,9 @@ def _pdf_to_pages_text(file_path: str) -> List[str]:
         "Accept": "application/json"
     }
     
-    # 1. Wysylamy plik na serwery AI
     with open(file_path, "rb") as f:
         files = {"file": (os.path.basename(file_path), f, "application/pdf")}
-        data = {"language": "pl"} # Wymuszamy jezyk polski
+        data = {"language": "pl"} 
         
         resp = requests.post(f"{base_url}/upload", headers=headers, files=files, data=data)
         if resp.status_code != 200:
@@ -69,7 +70,6 @@ def _pdf_to_pages_text(file_path: str) -> List[str]:
             
         job_id = resp.json()["id"]
 
-    # 2. Czekamy cierpliwie az AI skonczy czytac (odpytujemy co 3 sekundy)
     while True:
         time.sleep(3)
         status_resp = requests.get(f"{base_url}/job/{job_id}", headers=headers)
@@ -79,31 +79,49 @@ def _pdf_to_pages_text(file_path: str) -> List[str]:
         if status == "SUCCESS":
             break
         elif status in ["ERROR", "FAILED", "CANCELED"]:
-            raise Exception(f"LlamaParse napotkalo blad podczas analizy. Status: {status}")
+            raise Exception(f"LlamaParse napotkalo blad. Status: {status}")
 
-    # 3. Pobieramy gotowy, zrekonstruowany tekst (Markdown z tabelami)
     res_resp = requests.get(f"{base_url}/job/{job_id}/result/markdown", headers=headers)
     res_resp.raise_for_status()
     markdown_text = res_resp.json()["markdown"]
 
-    # Zwracamy calosc - LlamaParse samo zadbalo o odpowiedni format
     return [markdown_text]
 
-def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
+# -------------------------
+# INTELIGENTNE CIĘCIE (Semantic Chunking)
+# -------------------------
+def _chunk_markdown_semantically(text: str) -> List[Dict[str, str]]:
     if not text:
         return []
-    chunks = []
-    i = 0
-    n = len(text)
-    while i < n:
-        end = min(i + max_chars, n)
-        chunk = text[i:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == n:
-            break
-        i = max(0, end - overlap)
-    return chunks
+    
+    # 1. Definiujemy, jakie naglowki oznaczaja nowy "rozdzial"
+    headers_to_split_on = [
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+    ]
+    markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+    md_header_splits = markdown_splitter.split_text(text)
+    
+    # 2. Jesli rozdzial jest zbyt gigantyczny, tniemy go madrze (nie przecinajac akapitow)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1500, 
+        chunk_overlap=200
+    )
+    final_splits = text_splitter.split_documents(md_header_splits)
+    
+    results = []
+    for split in final_splits:
+        # Doklejamy naglowek na poczatek tekstu jako metadane kontekstowe
+        context_path = " > ".join(split.metadata.values())
+        if context_path:
+            content = f"[{context_path}]\n{split.page_content}"
+        else:
+            content = split.page_content
+            
+        results.append(content.strip())
+        
+    return results
 
 def _batched(lst: List[Dict[str, Any]], batch_size: int = 90):
     for i in range(0, len(lst), batch_size):
@@ -137,8 +155,11 @@ async def ingest(namespace: str = "default", file: UploadFile = File(...)):
                 continue
             pages_with_text += 1
 
-            chunks = _chunk_text(page_text)
+            # Tu uzywamy naszej nowej, inteligentnej funkcji z LangChain
+            chunks = _chunk_markdown_semantically(page_text)
+            
             for chunk_idx, chunk in enumerate(chunks, start=1):
+                if not chunk: continue
                 records.append(
                     {
                         "_id": uuid.uuid4().hex,

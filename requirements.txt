@@ -3,3 +3,4 @@ uvicorn[standard]==0.30.6
 pinecone>=6.0.0
 python-multipart==0.0.9
 requests==2.31.0
+langchain-text-splitters==0.3.6
